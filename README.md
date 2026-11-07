@@ -45,20 +45,20 @@ The system consists of three main components:
 
 ### Architecture Diagram
 ```
-┌─────────────────┐    ┌─────────────────┐
-│   Tracker 1     │◄──►│   Tracker 2     │
-│   (Primary)     │    │   (Backup)      │
-└─────────┬───────┘    └─────────┬───────┘
-          │                      │
-          └──────────┬───────────┘
-                     │
-          ┌──────────┴───────────┐
-          │                      │
-    ┌─────▼──────┐        ┌──────▼─────┐
-    │  Client A  │◄──────►│  Client B  │
-    │ (Seeder/   │        │ (Seeder/   │
-    │ Downloader)│        │ Downloader)│
-    └────────────┘        └────────────┘
+┌─────────────────┐  sync (port+100)  ┌─────────────────┐
+│   Tracker 1     │◄─────────────────►│   Tracker 2     │
+│   (Primary)     │  full state +     │   (Backup)      │
+│                 │  live UPDATEs     │ takes over if   │
+└────────┬────────┘                   │ primary dies    │
+         │ commands                   └─────────────────┘
+         │ (clients talk only to the current primary)
+   ┌─────┴────────────────┐
+   │                      │
+┌──▼─────────┐  GET_PIECE ┌▼───────────┐
+│  Client A  │◄──────────►│  Client B  │
+│ (Seeder/   │            │ (Seeder/   │
+│ Downloader)│            │ Downloader)│
+└────────────┘            └────────────┘
 ```
 
 ## Compilation Instructions
@@ -104,11 +104,13 @@ make
 ## Execution Instructions
 
 ### 1. Setup Tracker Configuration
-Create `tracker/tracker_info.txt` with tracker details:
+Create `tracker/tracker_info.txt` with tracker details, one tracker per line
+(`IP PORT` or `IP:PORT` both work):
 ```
-127.0.0.1:5000
-127.0.0.1:5001
+127.0.0.1 5000
+127.0.0.1 5001
 ```
+Each tracker also uses `PORT + 100` (5100 / 5101 here) for tracker-to-tracker sync.
 
 ### 2. Start Tracker Servers
 
@@ -173,7 +175,7 @@ upload_file group1 /path/to/file.txt
 # List files in group
 list_files group1
 
-# Download a file
+# Download a file (destination can be a directory or a full file path)
 download_file group1 file.txt /path/to/destination/
 
 # Show download progress
@@ -216,31 +218,39 @@ Response Format: <STATUS> <DATA>
 
 Status Codes:
 - OK: Success
-- ERR <CODE>: Error with specific code
+- ERR <message>: Failure with a human-readable reason
+
+Every tracker response is terminated with `\n\0`, so multi-line replies
+(`list_groups`, `list_files`, ...) are always read in full.
 ```
 
 #### Example Messages
 ```bash
 # User creation
 Client → Tracker: "create_user john password123"
-Tracker → Client: "OK User created successfully"
+Tracker → Client: "OK User created: john"
 
 # File download request
 Client → Tracker: "download_file group1 file.txt"
-Tracker → Client: "OK DOWNLOAD file.txt 1048576 2 abc123... group1 hash1 hash2 PEER 192.168.1.1:7001"
+Tracker → Client: "OK DOWNLOAD file.txt 1048576 2 <full_sha1> group1 <piece0_sha1> <piece1_sha1> PEER 192.168.1.1:7001 PEER ..."
+                  (only peers whose user is currently logged in are listed)
 
 # Piece request
 Client → Peer: "GET_PIECE file.txt 0"
-Peer → Client: "OK <512KB_DATA>"
+Peer → Client: <raw piece bytes>   (or "ERR <reason>")
 ```
 
 #### Peer-to-Peer Protocol
 ```
 GET_PIECE <filename> <piece_index>
-Response: OK <piece_data> | ERR <reason>
+Response: <raw piece bytes, 512 KB or less for the last piece> | ERR <reason>
+(one TCP connection per piece request)
 ```
 
 ### Error Codes
+These constants are defined in `common/include/protocol.h`. Replies carry a
+readable message (for example `ERR You are not a member of group g1`); only
+`ERR_INTERNAL` (500) is put on the wire, by `create_user` and for unknown commands.
 ```cpp
 #define ERR_USER_EXISTS 101
 #define ERR_INVALID_LOGIN 102
@@ -260,11 +270,20 @@ Response: OK <piece_data> | ERR <reason>
 #### 1. SystemState (Tracker)
 ```cpp
 class SystemState {
-    unordered_map<string, User> users;           // User database
-    unordered_map<string, Group> groups;         // Group information
-    unordered_map<string, string> userSessions;  // Active sessions
-    unordered_map<string, FileInfo> sharedFiles; // File metadata
-}
+    map<string, User> users;                              // userId -> password, loggedIn
+    map<string, Group> groups;                            // groupId -> owner, members,
+                                                          //   pendingRequests, memberOrder
+    map<string, map<string, FileMetadata>> groupFiles;    // groupId -> fileName -> metadata
+    map<string, string> userSessions;                     // userId -> "IP:PORT" of its seeder
+};
+
+struct FileMetadata {        // tracker side
+    string groupId, fileName, fullHash;
+    size_t fileSize, numChunks;
+    vector<string> pieceHashes;
+    set<string> owners;      // users sharing the file
+    set<string> activePeers; // filled per request from owners who are logged in
+};
 ```
 
 #### 2. DownloadMetadata (Client)
@@ -288,14 +307,16 @@ struct DownloadContext {
     map<size_t, int> retryCount;        // Per-piece retry tracking
     vector<bool> pieceDone;             // Completion status
     size_t piecesCompleted;             // Progress counter
+    mt19937 rng;                        // Random peer order
+    string owner;                       // User who started the download
 };
 ```
 
 ### Design Rationale
 
-#### Hash Maps for O(1) Lookup
-- **User/Group Management**: `unordered_map` provides constant-time user and group lookups
-- **Session Management**: Fast session validation during authenticated operations
+#### Ordered Maps for Lookup
+- **User/Group/File Management**: `std::map` gives O(log n) lookups and sorted output for `list_groups` / `list_files`
+- **Session Management**: per-connection `ClientSession` (keyed by socket) tells the tracker who is logged in on each connection
 
 #### Thread-Safe Collections
 - **Mutex Protection**: All shared data structures protected with appropriate mutexes
@@ -311,14 +332,16 @@ struct DownloadContext {
 ```cpp
 const size_t CHUNK = 512 * 1024;  // 512KB pieces
 
-// Divide file into pieces
-while ((n = read(fd, buf, CHUNK)) > 0) {
-    // Calculate SHA1 for this piece
-    computeSHA1(buf, n, hashHex);
+// Divide file into pieces; each piece is filled completely even if read()
+// returns short counts, so piece boundaries always fall on 512 KB multiples
+while (true) {
+    size_t got = 0;
+    while (got < CHUNK && (n = read(fd, buf + got, CHUNK - got)) > 0) got += n;
+    if (got == 0) break;
+    computeSHA1(buf, got, hashHex);          // SHA1 of this piece
     pieceHashes.push_back(string(hashHex));
-    
-    // Update full file hash
-    SHA1_Update(&fullCtx, buf, n);
+    SHA1_Update(&fullCtx, buf, got);         // running SHA1 of the whole file
+    if (got < CHUNK) break;                  // last (short) piece
 }
 ```
 
@@ -326,20 +349,21 @@ while ((n = read(fd, buf, CHUNK)) > 0) {
 
 ### 2. Multi-threaded Download Strategy
 ```cpp
-// Worker thread algorithm
-while (!workQueue.empty()) {
-    size_t pieceIndex = workQueue.front();
-    workQueue.pop();
-    
-    // Try different peers for this piece
-    for (const string& peer : peers) {
+// Up to 8 worker threads run this loop on a shared queue of piece indexes
+while (pop pieceIndex from workQueue) {          // under queueMutex
+    shuffle(peers);                               // random peer order per piece
+    for (peer : peers) {
+        // connect, GET_PIECE, receive, check SHA1, pwrite() at pieceIndex * 512 KB
         if (requestPiece(peer, fileName, pieceIndex, expectedHash, expectedSize, fd)) {
-            pieceDone[pieceIndex] = true;
-            piecesCompleted++;
+            pieceDone[pieceIndex] = true; piecesCompleted++;
             break;
         }
     }
+    if (no peer succeeded && ++retryCount[pieceIndex] <= 3)
+        workQueue.push(pieceIndex);               // try again later
 }
+// afterwards: all pieces done? -> verify whole-file SHA1 -> register as seeder
+// otherwise the partial file is deleted
 ```
 
 **Features**:
@@ -349,25 +373,31 @@ while (!workQueue.empty()) {
 
 ### 3. Tracker Synchronization Algorithm
 ```cpp
-void TrackerSync::synchronize(const string& data) {
-    lock_guard<mutex> lock(syncMutex);
-    
-    // Send to peer tracker
-    if (sendToPeer(data)) {
-        lastSyncTime = time(nullptr);
-    } else {
-        pendingUpdates.push(data);  // Queue for later
-    }
+// Startup: try to connect to the other tracker's sync port (client port + 100).
+//   connected  -> BACKUP: send SYNC_REQUEST, load the full SYNC_RESPONSE snapshot,
+//                 then apply every "UPDATE ..." line the primary sends
+//   refused    -> PRIMARY: listen for clients and for a backup
+//
+// Primary, after every successful state change:
+void TrackerSync::sendUpdate(const string &update) {   // e.g. "LOGIN bob 127.0.0.1:7002"
+    if (tracker.getRole() != Tracker::PRIMARY) return;
+    updateLog.push_back(update);
+    sendMessage("UPDATE " + update);                   // under sendMutex
 }
+// Backup: applyUpdate() replays CREATE_USER, LOGIN, LOGOUT, GROUP_CREATE, JOIN_GROUP,
+//         ACCEPT_REQUEST, LEAVE_GROUP, UPLOAD_FILE, STOP_SHARE on its own SystemState.
+// Sync connection closes -> backup promotes itself to PRIMARY and starts serving clients;
+//                           a restarted tracker then joins as the new BACKUP.
 ```
 
 **Features**:
-- **Immediate Sync**: Changes propagated to backup tracker immediately
-- **Failure Handling**: Updates queued if peer tracker unavailable
-- **Consistency**: Ensures both trackers maintain identical state
+- **Immediate Sync**: every change is sent to the backup as soon as it is applied
+- **Full Snapshot on Join**: a (re)starting backup first copies the whole state, so it can join at any time
+- **Consistency**: the snapshot is taken and sent under the same lock as updates, so no update is lost or reordered
+- **Client Failover**: clients detect the lost connection, find the new primary and log in again automatically
 
 ### 4. Piece Selection Strategy
-- **Sequential Download**: Pieces downloaded in order for simplicity
+- **In-order Queue**: pieces are queued in order and handed to 8 parallel workers
 - **Load Distribution**: Random peer selection spreads network load
 - **Retry Logic**: Failed pieces automatically retried up to maximum attempts
 
@@ -375,10 +405,14 @@ void TrackerSync::synchronize(const string& data) {
 
 ### Thread Safety Mechanisms
 ```cpp
-// Global mutexes for shared resources
-static mutex downloadsMutex;          // Protects active downloads
-static mutex seedingFilesMutex;       // Protects seeding file list
-static mutex stateMutex;              // Protects tracker state
+// Mutexes for shared resources
+mutex stateMutex;          // tracker: users, groups, files, sessions (SystemState)
+mutex sessionMutex;        // tracker: per-connection login sessions
+mutex sendMutex;           // tracker: writes on the sync connection
+mutex downloadsMutex;      // client: active downloads (show_downloads)
+mutex seedingFilesMutex;   // client: files this user is sharing
+mutex trackerIOMutex;      // client: one request/response on the tracker socket at a time
+mutex queueMutex;          // client: per-download piece queue and progress
 ```
 
 ### File Integrity Verification
@@ -396,11 +430,14 @@ setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 ```
 
 ### Memory Management
-- **RAII Principles**: Smart pointers and stack-based objects
+- **RAII Principles**: `lock_guard` for all locking, `vector` for buffers
 - **Vector for Buffers**: Automatic memory management for file buffers
 - **Stream Processing**: Files processed without loading entirely into memory
 
 ## Testing Procedures
+
+> The complete step-by-step test plan, with the exact commands and expected
+> output for every feature, is in **[run.md](run.md)**.
 
 ### 1. Unit Testing
 
@@ -452,12 +489,12 @@ download_file group1 large.txt /tmp/large_copy.txt
 ### 3. Stress Testing
 
 #### Concurrent Downloads
-```bash
-# Multiple simultaneous downloads
-download_file group1 file1.txt /tmp/file1.txt &
-download_file group1 file2.txt /tmp/file2.txt &
-download_file group1 file3.txt /tmp/file3.txt &
-wait
+Downloads run in the background, so type several in a row at the `client>` prompt:
+```
+download_file group1 file1.txt /tmp/file1.txt
+download_file group1 file2.txt /tmp/file2.txt
+download_file group1 file3.txt /tmp/file3.txt
+show_downloads
 ```
 
 #### Network Fault Simulation
@@ -468,9 +505,9 @@ wait
 ### 4. Performance Testing
 
 #### Throughput Measurement
+Timestamps of the first and last piece of a download are in `downloads.log`:
 ```bash
-# Time large file transfers
-time download_file group1 100mb_file.txt /tmp/test.txt
+grep "large.txt piece" downloads.log | sed -n '1p;$p'
 ```
 
 #### Memory Usage Monitoring
@@ -482,13 +519,16 @@ top -p $(pgrep client)
 ## Limitations and Assumptions
 
 ### Current Limitations
-1. **Single Tracker Failure**: System unavailable if both trackers fail
+1. **Both Trackers Down**: System unavailable if both trackers fail at once (one failing is handled: the backup takes over and clients reconnect and re-login automatically)
 2. **No Resume Support**: Downloads must restart if interrupted
-3. **Basic Error Recovery**: Limited retry mechanisms for network failures
+3. **Retry Limits**: Each piece is tried up to 4 times across all peers before the download fails
 4. **Sequential Piece Selection**: No advanced piece selection algorithms
 5. **Memory Usage**: Large file lists may consume significant memory
-6. **No Encryption**: Network communication not encrypted
+6. **No Encryption**: Network communication not encrypted; passwords are stored and sent in plain text
 7. **Limited Scalability**: Performance may degrade with many concurrent users
+8. **Names**: file names and paths given to commands cannot contain spaces
+9. **One name per user**: a user cannot seed two different files with the same name in two different groups
+10. **In-memory tracker state**: users and groups are lost if both trackers stop
 
 ### Assumptions Made
 1. **Reliable Local Network**: Designed for LAN environments
@@ -511,6 +551,7 @@ top -p $(pgrep client)
 ```
 2025201031_A3_2/
 ├── README.md                    # This file
+├── run.md                       # Step-by-step test plan for every feature
 ├── client/                      # Client application
 │   ├── Makefile                # Build configuration
 │   ├── include/                # Header files

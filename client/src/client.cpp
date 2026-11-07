@@ -5,6 +5,8 @@
 #include <cstring>
 using namespace std;
 
+mutex trackerIOMutex;
+
 Client::Client(string ip, int port){
     trackerIP = ip;
     trackerPort = port;
@@ -30,7 +32,7 @@ bool Client::connectToTracker(bool quiet){
     }
 
     if(connect(sock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0){
-        perror("[CLIENT] Connection failed");
+        if(!quiet) perror("[CLIENT] Connection failed");
         close(sock);
         sock = -1;
         return false;
@@ -47,7 +49,6 @@ void Client::disconnect(){
     if(sock >= 0){
         close(sock);
         sock = -1;
-        cout<<"[CLIENT] Disconnected from tracker\n";
     }
 }
 
@@ -61,7 +62,7 @@ bool Client::sendMessage(const string &msg){
     const char *ptr = data.c_str();
     size_t remaining = data.size();
     while(remaining > 0){
-        ssize_t sent = send(sock, ptr, remaining, 0);
+        ssize_t sent = send(sock, ptr, remaining, MSG_NOSIGNAL);
         if(sent < 0){
             if(errno == EINTR) continue;
             perror("[CLIENT] Send failed");
@@ -76,13 +77,13 @@ bool Client::sendMessage(const string &msg){
 string Client::receiveMessage() {
     if (sock < 0) return "";
 
+    // The tracker ends every response with "\n\0", so a multi-line reply is
+    // returned whole even if it arrives in several TCP segments.
     while (true) {
-        size_t pos = recvBuf.find('\n');
+        size_t pos = recvBuf.find('\0');
         if (pos != string::npos) {
-
-            string msg = recvBuf.substr(0, recvBuf.size());
-            recvBuf.clear();
-
+            string msg = recvBuf.substr(0, pos);
+            recvBuf.erase(0, pos + 1);
             while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) {
                 msg.pop_back();
             }
@@ -95,18 +96,17 @@ string Client::receiveMessage() {
             recvBuf.append(buffer, (size_t)n);
             continue;
         } else if (n == 0) {
-
-            if (!recvBuf.empty()) {
-                string msg = recvBuf;
-                recvBuf.clear();
-                while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
-                    msg.pop_back();
-                return msg;
-            }
+            // Tracker closed the connection; an incomplete reply is useless.
+            recvBuf.clear();
+            close(sock);
+            sock = -1;
             return "";
         } else {
             if (errno == EINTR) continue;
             perror("[CLIENT] Recv failed");
+            recvBuf.clear();
+            close(sock);
+            sock = -1;
             return "";
         }
     }

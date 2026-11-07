@@ -2,7 +2,12 @@
 #define CLIENT_H
 
 #include <string>
+#include <mutex>
 using namespace std;
+
+// Held for every request/response exchange on the tracker socket, so the
+// background auto-share after a download never interleaves with a command.
+extern mutex trackerIOMutex;
 
 class Client {
 private:
@@ -12,7 +17,7 @@ private:
     string recvBuf;
     string recvBuffer;
     string userId;
-\
+
     string selfIP;
     int selfPort;
 

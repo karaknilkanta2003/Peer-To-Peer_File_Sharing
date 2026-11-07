@@ -22,8 +22,12 @@ void saveSeeds(const string &userId,
     }
 
     for (auto &entry : seedingFiles) {
-        string line = entry.first + " " + entry.second.path + " " + entry.second.groupId + "\n";
-        write(fd, line.c_str(), line.size());
+        // Tab-separated so paths containing spaces survive a round trip.
+        string line = entry.first + "\t" + entry.second.groupId + "\t" + entry.second.path + "\n";
+        if (write(fd, line.c_str(), line.size()) < 0) {
+            perror("saveSeeds: write");
+            break;
+        }
     }
     close(fd);
 }
@@ -48,10 +52,18 @@ map<string, SeedInfo> loadSeeds(const string &userId) {
         if (end == string::npos) end = content.size();
         string line = content.substr(pos, end - pos);
         if (!line.empty()) {
-            istringstream iss(line);
-            string fileName, filePath, groupId;
-            if (iss >> fileName >> filePath >> groupId) {
-                seeds[fileName] = {filePath, groupId};
+            size_t t1 = line.find('\t');
+            size_t t2 = (t1 == string::npos) ? string::npos : line.find('\t', t1 + 1);
+            if (t2 != string::npos) {
+                // name \t group \t path
+                seeds[line.substr(0, t1)] = {line.substr(t2 + 1), line.substr(t1 + 1, t2 - t1 - 1)};
+            } else {
+                // legacy format: name path group
+                istringstream iss(line);
+                string fileName, filePath, groupId;
+                if (iss >> fileName >> filePath >> groupId) {
+                    seeds[fileName] = {filePath, groupId};
+                }
             }
         }
         pos = end + 1;

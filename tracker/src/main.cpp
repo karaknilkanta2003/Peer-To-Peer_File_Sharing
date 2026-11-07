@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <cstring>
 #include <cstdlib>
+#include <csignal>
 using namespace std;
 
 int main(int argc, char* argv[]) {
@@ -15,8 +16,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // A peer that disconnects mid-send must not kill the tracker.
+    signal(SIGPIPE, SIG_IGN);
+
     const char* infoFile = argv[1];
-    int trackerNo = stoi(argv[2]);
+    int trackerNo = atoi(argv[2]);
 
     int fd = open(infoFile, O_RDONLY);
     if (fd < 0) {
@@ -34,6 +38,11 @@ int main(int argc, char* argv[]) {
     buffer[n] = '\0';
     close(fd);
 
+    // Accept both "IP PORT" and "IP:PORT" lines.
+    for (ssize_t i = 0; i < n; ++i) {
+        if (buffer[i] == ':') buffer[i] = ' ';
+    }
+
     vector<pair<string,int>> trackers;
     char* line = strtok(buffer, "\n");
     while (line != nullptr) {
@@ -45,8 +54,13 @@ int main(int argc, char* argv[]) {
         line = strtok(nullptr, "\n");
     }
 
-    if (trackerNo < 1 || trackerNo > (int)trackers.size()) {
-        cerr << "Error: invalid tracker_no\n";
+    if (trackers.size() < 2) {
+        cerr << "Error: " << infoFile << " must list two trackers (one \"IP PORT\" per line)\n";
+        return 1;
+    }
+
+    if (trackerNo < 1 || trackerNo > 2) {
+        cerr << "Error: tracker_no must be 1 or 2\n";
         return 1;
     }
 
@@ -55,12 +69,11 @@ int main(int argc, char* argv[]) {
 
     int peerNo = (trackerNo == 1 ? 2 : 1);
     string peerIP = trackers[peerNo-1].first;
-    int peerPort       = trackers[peerNo-1].second;
+    int peerPort  = trackers[peerNo-1].second;
 
-    cout << "[MAIN] Tracker " << trackerNo << " running at " << myIP << ":" << myPort << ", peer at " << peerIP << ":" << peerPort << "\n";
-
-    int syncPort = myPort + 1000;
-    int peerSyncPort = peerPort + 1000;
+    cout << "[MAIN] Tracker " << trackerNo << " running at " << myIP << ":" << myPort
+         << ", peer at " << peerIP << ":" << peerPort
+         << " (sync ports " << myPort + 100 << "/" << peerPort + 100 << ")\n";
 
     Tracker tracker(myIP, myPort, peerIP, peerPort);
 

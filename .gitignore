@@ -1,0 +1,7 @@
+# build output
+*.o
+client/client
+tracker/tracker
+# runtime logs
+downloads.log
+uploads.log

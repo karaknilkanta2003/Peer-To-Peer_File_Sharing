@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <algorithm>
+#include <cerrno>
 using namespace std;
 
 TrackerSync::TrackerSync(int mySyncPort, string peerIP, int peerSyncPort, Tracker &t, SystemState &s) : mySyncPort(mySyncPort), peerIP(peerIP), peerSyncPort(peerSyncPort), tracker(t), systemState(s) {
@@ -41,7 +42,7 @@ void TrackerSync::connectToPeer() {
     peerAddr.sin_port = htons(peerSyncPort);
     inet_pton(AF_INET, peerIP.c_str(), &peerAddr.sin_addr);
     if (connect(connSock, (struct sockaddr*)&peerAddr, sizeof(peerAddr)) < 0) {
-        close(connSock);
+        close(connSock.load());
         connSock = -1;
     }
 }
@@ -89,7 +90,7 @@ void TrackerSync::acceptBackupConnection() {
 }
 
 void TrackerSync::sendUpdate(const string &update) {
-    if (tracker.getRole() != PRIMARY) return;
+    if (tracker.getRole() != Tracker::PRIMARY) return;
     {
         lock_guard<mutex> lock(logMutex);
         updateLog.push_back(update);
@@ -100,11 +101,16 @@ void TrackerSync::sendUpdate(const string &update) {
 }
 
 string TrackerSync::serializeSystemState() {
+    lock_guard<mutex> guard(SystemState::lock());
     string out;
 
     for (auto &p : systemState.users) {
         const User &u = p.second;
         out += "USER "+u.userId+" "+u.passwordHash+" " + (u.loggedIn ? "1" : "0") + "\n";
+    }
+
+    for (auto &p : systemState.userSessions) {
+        out += "SESSION " + p.first + " " + p.second + "\n";
     }
 
     for (auto &g : systemState.groups) {
@@ -153,6 +159,7 @@ string TrackerSync::serializeSystemState() {
 
 
 void TrackerSync::deserializeSystemState(const string &data) {
+    lock_guard<mutex> guard(SystemState::lock());
     systemState = SystemState();
     istringstream iss(data);
     string line;
@@ -172,7 +179,12 @@ void TrackerSync::deserializeSystemState(const string &data) {
             u.passwordHash = pass;
             u.loggedIn = (logged == "1");
             systemState.users[userId] = u;
-        } 
+        }
+        else if (type == "SESSION") {
+            string userId, addr;
+            ls >> userId >> addr;
+            systemState.userSessions[userId] = addr;
+        }
         else if (type == "GROUP") {
             string gid, owner;
             ls >> gid >> owner;
@@ -197,6 +209,7 @@ void TrackerSync::deserializeSystemState(const string &data) {
             ls >> gid >> fname >> fsize >> numChunks >> fullHash;
 
             FileMetadata fm;
+            fm.groupId = gid;
             fm.fileName = fname;
             fm.fileSize = fsize;
             fm.numChunks = numChunks;
@@ -237,18 +250,15 @@ void TrackerSync::applyUpdate(const string &update) {
     string t(type);
 
     if (t == "CREATE_USER") {
-        User u;
-        u.userId = arg1;
-        u.passwordHash = arg2;
-        systemState.users[u.userId] = u;
-    } 
+        string errMsg;
+        systemState.createUser(arg1, arg2, errMsg);
+    }
+    else if (t == "LOGIN") {
+        systemState.markLoggedIn(arg1, arg2);
+    }
     else if (t == "GROUP_CREATE") {
-        Group g;
-        g.groupId = arg1;
-        g.ownerId = arg2;
-        g.members.insert(arg2);
-        g.memberOrder.push_back(arg2);
-        systemState.groups[g.groupId] = g;
+        string errMsg;
+        systemState.createGroup(arg1, arg2, errMsg);
     }
     else if (t == "JOIN_GROUP") {
         string errMsg;
@@ -282,7 +292,6 @@ void TrackerSync::applyUpdate(const string &update) {
 
         string errMsg;
         systemState.uploadFile(gid, userId, fileName, fileSize, numChunks, fullHash, pieceHashes, errMsg);
-        systemState.groupFiles[gid][fileName].owners.insert(userId);
     }
 
     else if (t == "STOP_SHARE") {
@@ -302,11 +311,14 @@ void TrackerSync::handlePeerUpdates() {
         cout << "[SYNC] Received raw: [" << msg << "]\n";
 
         if (msg == "__DISCONNECT__") {
-            if (tracker.getRole() == PRIMARY) {
+            if (tracker.getRole() == Tracker::PRIMARY) {
                 cout << "[SYNC] Backup disconnected\n";
-                if (connSock != -1) {
-                    close(connSock);
-                    connSock = -1;
+                {
+                    lock_guard<mutex> lock(sendMutex);
+                    if (connSock != -1) {
+                        close(connSock.load());
+                        connSock = -1;
+                    }
                 }
                 thread(&TrackerSync::acceptBackupConnection, this).detach();
                 return;
@@ -322,17 +334,20 @@ void TrackerSync::handlePeerUpdates() {
             continue;
         }
 
-        if (msg == "SYNC_REQUEST" && tracker.getRole() == PRIMARY) {
+        if (msg == "SYNC_REQUEST" && tracker.getRole() == Tracker::PRIMARY) {
             cout << "[SYNC] Received SYNC_REQUEST from backup\n";
+            // Hold sendMutex across snapshot+send so no UPDATE for a change
+            // made after the snapshot can overtake it.
+            lock_guard<mutex> lock(sendMutex);
             string snapshot = serializeSystemState();
 
             for (char &c : snapshot) {
                 if (c == '\n') c = ';';
             }
-            sendMessage("SYNC_RESPONSE " + snapshot);
+            sendRaw("SYNC_RESPONSE " + snapshot);
             cout << "[SYNC] Sent full state to backup\n";
         } 
-        else if (msg.rfind("SYNC_RESPONSE ", 0) == 0 && tracker.getRole() == BACKUP) {
+        else if (msg.rfind("SYNC_RESPONSE ", 0) == 0 && tracker.getRole() == Tracker::BACKUP) {
             string stateStr = msg.substr(14);
             for (char &c : stateStr) {
                 if (c == ';') c = '\n';
@@ -357,12 +372,15 @@ void TrackerSync::syncFromPrimary() {
 }
 
 void TrackerSync::promoteToPrimary() {
-    if (tracker.getRole() == PRIMARY) return;
+    if (tracker.getRole() == Tracker::PRIMARY) return;
     tracker.setRole(Tracker::PRIMARY);
     cout << "[SYNC] Promoted to PRIMARY (peer died)\n";
-    if (connSock != -1) {
-        close(connSock);
-        connSock = -1;
+    {
+        lock_guard<mutex> lock(sendMutex);
+        if (connSock != -1) {
+            close(connSock.load());
+            connSock = -1;
+        }
     }
 
     tracker.start();
@@ -371,21 +389,40 @@ void TrackerSync::promoteToPrimary() {
 }
 
 void TrackerSync::replayLog() {
-    if (tracker.getRole() != PRIMARY || connSock == -1) return;
+    if (tracker.getRole() != Tracker::PRIMARY || connSock == -1) return;
     lock_guard<mutex> lock(logMutex);
+    lock_guard<mutex> slock(sendMutex);
     for (const auto &entry : updateLog) {
-        sendMessage("UPDATE " + entry);
+        sendRaw("UPDATE " + entry);
     }
     cout << "[SYNC] Replayed " << updateLog.size() << " updates to backup\n";
 }
 
 void TrackerSync::sendMessage(const string &msg) {
-    if (connSock == -1) return;
+    lock_guard<mutex> lock(sendMutex);
+    sendRaw(msg);
+}
+
+void TrackerSync::sendRaw(const string &msg) {
+    int sock = connSock.load();
+    if (sock == -1) return;
     string data = msg;
     if (data.empty() || data.back() != '\n') {
         data.push_back('\n');
     }
-    send(connSock, data.c_str(), data.size(), 0);
+    // Loop: large UPLOAD_FILE updates may not go out in one send().
+    const char *ptr = data.c_str();
+    size_t left = data.size();
+    while (left > 0) {
+        ssize_t n = send(sock, ptr, left, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("[SYNC] send failed");
+            return;
+        }
+        ptr += n;
+        left -= (size_t)n;
+    }
 }
 
 string TrackerSync::recvMessage() {
