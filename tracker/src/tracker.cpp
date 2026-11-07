@@ -6,9 +6,13 @@
 #include <arpa/inet.h>
 #include <csignal> 
 #include <cstring>
+#include <cerrno>
 using namespace std;
 
-Tracker::Tracker(string ip, int port, string peerIP, int peerPort) : myIP(ip), myPort(port), peerIP(peerIP), peerPort(peerPort), server_fd(-1), role(BACKUP), sync(port + 100, peerIP, peerPort + 100, *this, systemState) {}
+// Sync channel runs on client port + 100 for each tracker.
+Tracker::Tracker(string ip, int port, string peerIP, int peerPort)
+    : myPort(port), myIP(ip), peerIP(peerIP), peerPort(peerPort), server_fd(-1),
+      sync(port + 100, peerIP, peerPort + 100, *this, systemState) {}
 
 void Tracker::startSync() {
     sync.start();
@@ -151,14 +155,18 @@ void Tracker::handleClient(int clientSock) {
                     response = processCommand(line, clientSock);
                 }
 
-                if (response.empty() || response.back() != '\n') {
-                    response.push_back('\n');
+                // Frame: body + '\n' + '\0'. The NUL marks the end of a
+                // (possibly multi-line) response for the client.
+                while (!response.empty() && response.back() == '\n') {
+                    response.pop_back();
                 }
+                response.push_back('\n');
+                response.push_back('\0');
 
                 const char *ptr = response.c_str();
                 size_t toSend = response.size();
                 while (toSend > 0) {
-                    ssize_t sent = send(clientSock, ptr, toSend, 0);
+                    ssize_t sent = send(clientSock, ptr, toSend, MSG_NOSIGNAL);
                     if (sent < 0) {
                         if (errno == EINTR) continue;
                         perror("[TRACKER] Send failed");
@@ -247,9 +255,10 @@ string Tracker::processCommand(const string &cmd, int clientSock) {
             lock_guard<mutex> lock(sessionMutex);
             sessions[clientSock].userId = user;
             sessions[clientSock].loggedIn = true;
-            // optionally store peerAddr in session
             sessions[clientSock].peerAddr = peerAddr;
         }
+
+        sync.sendUpdate("LOGIN " + user + " " + peerAddr);
 
         return string(PROTO_OK) + " Logged in as " + user;
     }
@@ -459,6 +468,9 @@ string Tracker::processCommand(const string &cmd, int clientSock) {
         }
 
         string errMsg;
+        if (!systemState.checkMember(gid, user, errMsg)) {
+            return string(PROTO_ERR) + " " + errMsg;
+        }
         if (!systemState.uploadFile(gid, user, fileName, fileSize,
                                     numChunks, fullHash, pieceHashes, errMsg)) {
             return string(PROTO_ERR) + " " + errMsg;
@@ -491,6 +503,9 @@ string Tracker::processCommand(const string &cmd, int clientSock) {
         }
 
         string errMsg;
+        if (!systemState.checkMember(gid, user, errMsg)) {
+            return string(PROTO_ERR) + " " + errMsg;
+        }
         auto files = systemState.listFiles(gid, errMsg);
         if (!errMsg.empty()) {
             return string(PROTO_ERR) + " " + errMsg;
@@ -524,6 +539,9 @@ string Tracker::processCommand(const string &cmd, int clientSock) {
 
         FileMetadata meta;
         string errMsg;
+        if (!systemState.checkMember(gid, user, errMsg)) {
+            return string(PROTO_ERR) + " " + errMsg;
+        }
         if (!systemState.getFileMetadata(gid, fileName, meta, errMsg)) {
             return string(PROTO_ERR) + " " + errMsg;
         }
@@ -547,7 +565,7 @@ string Tracker::processCommand(const string &cmd, int clientSock) {
         string gid, fileName;
         iss >> gid >> fileName;
         if (gid.empty() || fileName.empty()) {
-            return string(PROTO_ERR) + " Missing arguments: stopshare <group_id> <file_name>";
+            return string(PROTO_ERR) + " Missing arguments: stop_share <group_id> <file_name>";
         }
 
         string user;

@@ -286,6 +286,7 @@ struct DownloadContext {
     map<size_t,int> retryCount;
     vector<bool> pieceDone;
     size_t piecesCompleted = 0;
+    string owner;   // user who started the download
 };
 
 static void downloadWorker(int tid, DownloadContext *ctx) {
@@ -344,30 +345,28 @@ static void downloadWorker(int tid, DownloadContext *ctx) {
 void showDownloads(const string &userId) {
     bool any = false;
 
-    vector<pair<string, DownloadContext*>> snapshot;
+    // Hold downloadsMutex while printing: the download thread erases its
+    // entry under this lock before freeing the context, so nothing printed
+    // here can be freed underneath us.
     {
         lock_guard<mutex> lock(downloadsMutex);
         for (auto &entry : activeDownloads) {
-            snapshot.push_back(entry);
-        }
-    }
+            DownloadContext *ctx = entry.second;
+            if (!ctx || !ctx->meta) continue;
+            if (ctx->owner != userId) continue;
 
-    for (auto &entry : snapshot) {
-        DownloadContext *ctx = entry.second;
-        if (!ctx->meta) continue;
-        if (ctx->meta->groupId.empty()) continue;
-
-        any = true;
-        size_t done = 0, total = 0;
-        {
-            lock_guard<mutex> qlock(ctx->queueMutex);
-            done = ctx->piecesCompleted;
-            total = ctx->meta ? ctx->meta->numChunks : 0;
+            any = true;
+            size_t done = 0, total = 0;
+            {
+                lock_guard<mutex> qlock(ctx->queueMutex);
+                done = ctx->piecesCompleted;
+                total = ctx->meta->numChunks;
+            }
+            int percent = (total > 0) ? (int)(100.0 * done / total) : 0;
+            cout << "[D] [" << ctx->meta->groupId << "] " << ctx->meta->fileName
+                 << " : " << done << "/" << total
+                 << " pieces (" << percent << "%) -> " << entry.first << endl;
         }
-        double percent = (total > 0) ? (100.0 * done / total) : 0.0;
-        cout << "[D] " << ctx->meta->groupId << " " << ctx->meta->fileName
-             << " : " << done << "/" << total
-             << " pieces (" << percent << "%)" << endl;
     }
 
     map<string, CompletedInfo> completed;
@@ -381,7 +380,7 @@ void showDownloads(const string &userId) {
 
     for (auto &p : completed) {
         any = true;
-        cout << "[C] " << p.second.groupId << " " << p.first << endl;
+        cout << "[C] [" << p.second.groupId << "] " << p.first << " -> " << p.second.path << endl;
     }
 
     if (!any) {
@@ -390,12 +389,24 @@ void showDownloads(const string &userId) {
 }
 
 
-static mutex clientUploadMutex;
-
 bool startDownload(Client &client, const DownloadMetadata &meta, const string &destPath) {
+    if (meta.fileName.empty() || meta.numChunks == 0 ||
+        meta.pieceHashes.size() != meta.numChunks) {
+        cerr << "[CLIENT] Tracker sent an invalid download response" << endl;
+        return false;
+    }
+    if (meta.peers.empty()) {
+        cerr << "[CLIENT] No online peer is sharing " << meta.fileName
+             << " right now. Try again when a seeder is logged in." << endl;
+        return false;
+    }
+
+    string userId = client.getUserId();
+
     DownloadContext *ctx = new DownloadContext();
     DownloadMetadata *metaCopy = new DownloadMetadata(meta);
     ctx->meta = metaCopy;
+    ctx->owner = userId;
     ctx->fd = -1;
     ctx->rng.seed(random_device{}());
     ctx->pieceDone.assign(metaCopy->numChunks, false);
@@ -404,29 +415,47 @@ bool startDownload(Client &client, const DownloadMetadata &meta, const string &d
 
     {
         lock_guard<mutex> lock(downloadsMutex);
-        activeDownloads[metaCopy->fileName] = ctx;
+        if (activeDownloads.count(destPath)) {
+            cerr << "[CLIENT] A download to " << destPath << " is already in progress" << endl;
+            delete metaCopy;
+            delete ctx;
+            return false;
+        }
+        activeDownloads[destPath] = ctx;
     }
 
-    thread([ctx, metaCopy, destPath, &client]() {
+    cout << "[CLIENT] Downloading " << meta.fileName << " (" << meta.fileSize << " bytes, "
+         << meta.numChunks << " pieces) from " << meta.peers.size()
+         << " peer(s) -> " << destPath << endl;
+
+    thread([ctx, metaCopy, destPath, userId, &client]() {
+        auto finish = [&]() {
+            lock_guard<mutex> lock(downloadsMutex);
+            activeDownloads.erase(destPath);
+            delete ctx->meta;
+            delete ctx;
+        };
+
         int fd = open(destPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (fd < 0) {
-            logDownloadEvent("[CLIENT] open dest failed: " + string(strerror(errno)));
-            lock_guard<mutex> lock(downloadsMutex);
-            activeDownloads.erase(metaCopy->fileName);
-            delete ctx->meta; delete ctx;
+            string err = strerror(errno);
+            logDownloadEvent("[CLIENT] open dest failed: " + err);
+            cerr << "\n[CLIENT] Cannot create " << destPath << ": " << err << endl;
+            finish();
             return;
         }
         if (ftruncate(fd, metaCopy->fileSize) < 0) {
-            logDownloadEvent("[CLIENT] ftruncate failed: " + string(strerror(errno)));
+            string err = strerror(errno);
+            logDownloadEvent("[CLIENT] ftruncate failed: " + err);
+            cerr << "\n[CLIENT] Cannot allocate " << destPath << ": " << err << endl;
             close(fd);
-            lock_guard<mutex> lock(downloadsMutex);
-            activeDownloads.erase(metaCopy->fileName);
-            delete ctx->meta; delete ctx;
+            unlink(destPath.c_str());
+            finish();
             return;
         }
 
         ctx->fd = fd;
-        int numThreads = min((size_t)8, metaCopy->numChunks);
+        int numThreads = (int)min((size_t)8, metaCopy->numChunks);
         vector<thread> workers;
         for (int i = 0; i < numThreads; ++i) workers.emplace_back(downloadWorker, i, ctx);
         for (auto &t : workers) t.join();
@@ -439,56 +468,47 @@ bool startDownload(Client &client, const DownloadMetadata &meta, const string &d
             done = ctx->piecesCompleted;
         }
 
-        bool ok;
-        if (done != metaCopy->numChunks) {
-            // Hashing an incomplete file only ever reports "hash mismatch",
-            // which points at corruption instead of at the missing pieces.
+        // Copy everything the follow-up needs before the context is freed.
+        string fileName = metaCopy->fileName;
+        string groupId = metaCopy->groupId;
+        size_t numChunks = metaCopy->numChunks;
+
+        if (done != numChunks) {
             logDownloadEvent("[CLIENT] Download failed: only " + to_string(done) + " of " +
-                             to_string(metaCopy->numChunks) + " pieces of " +
-                             metaCopy->fileName + " could be fetched from any peer");
-            cerr << "[CLIENT] Download failed: " << (metaCopy->numChunks - done) << " of "
-                 << metaCopy->numChunks << " pieces unavailable from any peer\n";
-            ok = false;
+                             to_string(numChunks) + " pieces of " + fileName +
+                             " could be fetched from any peer");
+            cerr << "\n[CLIENT] Download of " << fileName << " failed: " << (numChunks - done)
+                 << " of " << numChunks << " pieces unavailable from any peer (see downloads.log)\n";
             unlink(destPath.c_str());
-        } else if (!(ok = verifyFullFile(*metaCopy, destPath))) {
-            logDownloadEvent("[CLIENT] Download failed: hash mismatch for " + metaCopy->fileName);
+        } else if (!verifyFullFile(*metaCopy, destPath)) {
+            logDownloadEvent("[CLIENT] Download failed: hash mismatch for " + fileName);
+            cerr << "\n[CLIENT] Download of " << fileName << " failed: whole-file SHA1 mismatch\n";
             unlink(destPath.c_str());
         } else {
-            cout<<"[CLIENT] Download complete: "<<destPath<<endl;
-             {
+            cout << "\n[CLIENT] Download complete: " << destPath << " (SHA1 verified)" << endl;
+            {
                 lock_guard<mutex> lock(seedingFilesMutex);
-                string userId = client.getUserId();
-                string fileName = destPath.substr(destPath.find_last_of("/\\") + 1);
-                completedDownloads[userId][fileName] = {destPath, metaCopy->groupId};
+                completedDownloads[userId][fileName] = {destPath, groupId};
             }
 
-            thread([destPath, metaCopy, &client]() {
-                lock_guard<mutex> cguard(clientUploadMutex);
-                uploadFile(client, destPath, metaCopy->groupId);
-                {
-                    string trackerResp = client.receiveMessage();
-                    if (!trackerResp.empty()) {
-                        cout << "[TRACKER RESPONSE] " << trackerResp << endl;
-                    }
-                }
+            // Become a seeder for the file under its original name.
+            thread([destPath, fileName, groupId, userId, &client]() {
+                lock_guard<mutex> io(trackerIOMutex);
+                if (client.getUserId() != userId || !client.isConnected()) return;
 
-                lock_guard<mutex> lock(seedingFilesMutex);
-                string userId = client.getUserId();
-                string fileName = destPath.substr(destPath.find_last_of("/\\") + 1);
-                userSeeds[userId][fileName] = {destPath, metaCopy->groupId};
-                logDownloadEvent("[SEEDER] Added " + fileName + " for user " + userId +
-                                " in group " + metaCopy->groupId);
+                PendingUpload pu;
+                if (!uploadFile(client, destPath, groupId, pu, fileName)) return;
+                string resp = client.receiveMessage();
+                if (resp.rfind("OK", 0) == 0) {
+                    commitUpload(pu);
+                } else {
+                    cerr << "[CLIENT] Could not register " << fileName
+                         << " as seeded: " << resp << endl;
+                }
             }).detach();
         }
 
-        {
-            lock_guard<mutex> lock(downloadsMutex);
-            activeDownloads.erase(metaCopy->fileName);
-        }
-        delete ctx->meta; 
-        delete ctx;
-
-
+        finish();
     }).detach();
 
     return true;

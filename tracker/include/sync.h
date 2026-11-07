@@ -16,13 +16,14 @@ enum TrackerRole { PRIMARY, BACKUP };
 class TrackerSync {
 private:
     int listenSock;
-    int connSock;
+    atomic<int> connSock;
 
     int mySyncPort;
     string peerIP;
     int peerSyncPort;
 
     mutex logMutex;
+    mutex sendMutex;   // serialises writes on connSock
     vector<string> updateLog;
 
     Tracker &tracker;
@@ -32,6 +33,7 @@ private:
     atomic<bool> hasBackup{false};
 
     void sendMessage(const string &msg);
+    void sendRaw(const string &msg);   // caller must hold sendMutex
     string recvMessage();
 
     string serializeSystemState();

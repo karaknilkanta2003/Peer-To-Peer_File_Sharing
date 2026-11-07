@@ -5,6 +5,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <mutex>
 using namespace std;
 
 struct User {
@@ -51,6 +52,15 @@ public:
     vector<string> listFiles(const string &gid, string &errMsg);
     bool getFileMetadata(const string &gid, const string &fileName, FileMetadata &meta, string &errMsg);
     bool stopShare(const string &gid, const string &userId, const string &fileName, string &errMsg);
+
+    // Returns true if userId is a member of gid; otherwise sets errMsg.
+    bool checkMember(const string &gid, const string &userId, string &errMsg);
+
+    // Used by the backup tracker to mirror a login done on the primary.
+    void markLoggedIn(const string &userId, const string &peerAddr);
+
+    // Lock guarding all maps below (used by sync when (de)serializing).
+    static mutex &lock();
 
     map<string, User> users;
     map<string, Group> groups;
